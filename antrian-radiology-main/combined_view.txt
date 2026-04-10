@@ -1,0 +1,260 @@
+<!-- ==================== BLADE CONTENT (view-patient.blade.php) ==================== -->
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="ie=edge">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
+    <title>Pemanggilan Pasien</title>
+
+    <link rel="icon" type="image/png" href="{{ asset('favicon.ico') }}">
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+    <script src="https://js.pusher.com/8.2.0/pusher.min.js"></script>
+</head>
+
+<body class="bg-gray-100 min-h-screen py-10 px-4">
+    <div class="max-w-4xl mx-auto">
+        <div class="text-center mb-8">
+            <h1 class="text-4xl font-bold text-blue-800 mb-2">Pemanggilan Pasien</h1>
+        </div>
+
+        <div class="grid md:grid-cols-2 gap-6">
+            <div class="bg-white rounded-xl shadow-lg overflow-hidden">
+                <div class="bg-blue-600 text-white px-6 py-4">
+                    <h2 class="text-xl font-semibold">Sedang Dipanggil</h2>
+                </div>
+                <div class="p-6 text-center">
+                    <div class="current-patient">
+                        @if($current)
+                            <div class="text-4xl font-bold text-blue-600 mb-2">
+                                {{ $current->patient_name }}
+                            </div>
+                            <div class="text-lg text-gray-600">
+                                Pemeriksaan: {{ $current->examination_name }}
+                            </div>
+                            <div class="text-gray-600">
+                                Unit: {{ $current->unit }}
+                            </div>
+                            <div class="text-gray-500 mt-2">
+                                {{ \Carbon\Carbon::parse($current->arrival_date)->format('H:i') }} WIB
+                            </div>
+                        @else
+                            <div class="text-4xl font-bold text-gray-400 py-8">-</div>
+                            <p class="text-gray-500">Tidak ada pasien yang sedang dipanggil</p>
+                        @endif
+                    </div>
+                </div>
+            </div>
+
+            <div class="bg-white rounded-xl shadow-lg overflow-hidden">
+                <div class="bg-yellow-500 text-white px-6 py-4">
+                    <h2 class="text-xl font-semibold">Berikutnya</h2>
+                </div>
+                <div class="p-6 text-center">
+                    <div class="next-patient">
+                        @if($next)
+                            <div class="text-4xl font-bold text-yellow-500 mb-2">
+                                {{ $next->patient_name }}
+                            </div>
+                            <div class="text-lg text-gray-600">
+                                Pemeriksaan: {{ $next->examination_name }}
+                            </div>
+                            <div class="text-gray-600">
+                                Unit: {{ $next->unit }}
+                            </div>
+                            <div class="text-gray-500 mt-2">
+                                {{ \Carbon\Carbon::parse($next->arrival_date)->format('H:i') }} WIB
+                            </div>
+                        @else
+                            <div class="text-4xl font-bold text-gray-400 py-8">-</div>
+                            <p class="text-gray-500">Tidak ada antrian berikutnya</p>
+                        @endif
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="mt-8 bg-white rounded-xl shadow-lg p-6 text-center">
+            <h3 class="text-2xl font-semibold text-gray-800 mb-4">Informasi Pemanggilan</h3>
+            <div class="info-next">
+                @if($next)
+                    <p class="text-xl text-gray-700">
+                        Pasien selanjutnya yang akan dipanggil:
+                        <span class="font-bold text-blue-600">{{ $next->patient_name }}</span>
+                    </p>
+                    <p class="text-gray-600 mt-2">
+                        Pemeriksaan: {{ $next->examination_name }}
+                    </p>
+                    <p class="text-gray-600">
+                        Unit: {{ $next->unit }}
+                    </p>
+                @else
+                    <p class="text-xl text-gray-600">Tidak ada antrian pasien berikutnya</p>
+                @endif
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function escapeHtml(text) {
+            if (text === null || text === undefined) return '';
+            const div = document.createElement('div');
+            div.textContent = String(text);
+            return div.innerHTML;
+        }
+
+        const pusher = new Pusher('{{ config('broadcasting.connections.pusher.key') }}', {
+            cluster: '{{ config('broadcasting.connections.pusher.options.cluster') }}',
+            forceTLS: {{ config('broadcasting.connections.pusher.options.useTLS') ? 'true' : 'true' }}
+        });
+
+        const channel = pusher.subscribe('patient-calls');
+
+        function updateInfoNext(next) {
+            const infoBox = document.querySelector('.info-next');
+            if (!infoBox) return;
+
+            if (next) {
+                infoBox.innerHTML = `
+                    <p class="text-xl text-gray-700">
+                        Pasien selanjutnya yang akan dipanggil:
+                        <span class="font-bold text-blue-600">${escapeHtml(next.patient_name)}</span>
+                    </p>
+                    <p class="text-gray-600 mt-2">
+                        Pemeriksaan: ${escapeHtml(next.examination_name)}
+                    </p>
+                `;
+            } else {
+                infoBox.innerHTML = `
+                    <p class="text-xl text-gray-600">Tidak ada antrian pasien berikutnya</p>
+                `;
+            }
+        }
+
+        channel.bind('patient.called', function(data) {
+            updatePatientDisplay(data.current, data.next);
+            updateInfoNext(data.next);
+
+            if (data.current && data.current.patient_name) {
+                speak(`Panggilan kepada pasien atas nama ${data.current.patient_name} yang sedang dipanggil agar menuju ke Ruang Radiologi`);
+            }
+        });
+
+        function updatePatientDisplay(current, next) {
+            const currentPatientDiv = document.querySelector('.current-patient');
+            if (current) {
+                currentPatientDiv.innerHTML = `
+                    <div class="text-4xl font-bold text-blue-600 mb-2">
+                        ${escapeHtml(current.patient_name)}
+                    </div>
+                    <div class="text-lg text-gray-600">
+                        Pemeriksaan: ${escapeHtml(current.examination_name)}
+                    </div>
+                    <div class="text-gray-500 mt-2">
+                        ${new Date(current.arrival_date).toLocaleTimeString('id-ID', {hour: '2-digit', minute:'2-digit', hour12: false})} WIB
+                    </div>
+                `;
+            } else {
+                currentPatientDiv.innerHTML = `
+                    <div class="text-4xl font-bold text-gray-400 py-8">-</div>
+                    <p class="text-gray-500">Tidak ada pasien yang sedang dipanggil</p>
+                `;
+            }
+
+            const nextPatientDiv = document.querySelector('.next-patient');
+            if (next) {
+                nextPatientDiv.innerHTML = `
+                    <div class="text-4xl font-bold text-yellow-500 mb-2">
+                        ${escapeHtml(next.patient_name)}
+                    </div>
+                    <div class="text-lg text-gray-600">
+                        Pemeriksaan: ${escapeHtml(next.examination_name)}
+                    </div>
+                    <div class="text-gray-500 mt-2">
+                        ${new Date(next.arrival_date).toLocaleTimeString('id-ID', {hour: '2-digit', minute:'2-digit', hour12: false})} WIB
+                    </div>
+                `;
+            } else {
+                nextPatientDiv.innerHTML = `
+                    <div class="text-4xl font-bold text-gray-400 py-8">-</div>
+                    <p class="text-gray-500">Tidak ada antrian berikutnya</p>
+                `;
+            }
+        }
+
+        function speak(text) {
+            if ('speechSynthesis' in window) {
+                try {
+                    window.speechSynthesis.cancel();
+                } catch (e) {}
+
+                const speech = new SpeechSynthesisUtterance();
+                speech.text = text;
+                speech.lang = 'id-ID';
+                window.speechSynthesis.speak(speech);
+            }
+        }
+    </script>
+</body>
+</html>
+
+
+<!-- ==================== REACT COMPONENT (dashboard/page.jsx) ==================== -->
+import React from 'react';
+import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card"
+import PatientQueue from '@/Components/PatientQueue';
+
+export default function DashboardPage() {
+  const stats = []
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <header className="bg-white shadow">
+        <div className="max-w-7xl mx-auto py-6 px-4 sm:px-6 lg:px-8">
+          <div className="flex justify-between items-center">
+            <h1 className="text-2xl font-bold text-gray-900">Antrian Radiologi</h1>
+            <div className="text-sm text-gray-500">
+              {new Date().toLocaleDateString('id-ID', { 
+                weekday: 'long', 
+                year: 'numeric', 
+                month: 'long', 
+                day: 'numeric' 
+              })}
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+        <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-4">
+          {stats.map((stat, index) => (
+            <Card key={index} className="shadow-sm hover:shadow-md transition-shadow">
+              <CardHeader className="pb-2">
+                <p className="text-sm font-medium text-gray-500">{stat.title}</p>
+                <CardTitle className="text-2xl font-bold">{stat.value}</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className={`text-sm ${
+                  stat.trend === 'up' ? 'text-green-600' : 'text-red-600'
+                }`}>
+                  {stat.change} {stat.trend === 'up' ? '↑' : '↓'}
+                </div>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+
+        <div className="bg-white shadow rounded-lg overflow-hidden">
+          <div className="px-6 py-4 border-b border-gray-200">
+            <h2 className="text-lg font-medium text-gray-900">Daftar Antrian Pasien</h2>
+          </div>
+          <div className="p-4">
+            <PatientQueue />
+          </div>
+        </div>
+      </main>
+    </div>
+  );
+}

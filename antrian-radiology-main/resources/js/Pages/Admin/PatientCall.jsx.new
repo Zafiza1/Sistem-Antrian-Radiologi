@@ -1,0 +1,536 @@
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Head } from '@inertiajs/react';
+import Pusher from 'pusher-js';
+import axios from 'axios';
+import { Search } from 'lucide-react';
+
+// Only keep current patient in localStorage
+const CURRENT_PATIENT_KEY = 'current_patient';
+
+const getPatientUniqueId = (patient) => {
+  return `${patient.registration_id || patient.ID_REGISTRASI || 'no-reg'}-${patient.arrival_date || 'no-date'}`;
+};
+
+const normalizePatient = (patient) => {
+  const normalized = {
+    ...patient,
+    id: patient.id || patient.radiology_id || `temp-${Date.now()}`,
+    patient_name: patient.patient_name || patient.V_NAMAPASIEN || 'Nama tidak tersedia',
+    registration_id: patient.registration_id || patient.ID_REGISTRASI || `REG-${Date.now()}`,
+    examination_list: Array.isArray(patient.examination_list)
+      ? patient.examination_list
+      : patient.examination_names
+        ? patient.examination_names.split(';').map(e => e.trim()).filter(Boolean)
+        : [],
+    unit: patient.unit || patient.v_unit || 'pemeriksaan',
+    arrival_date: patient.arrival_date || patient.D_TGLDATANG || new Date().toISOString(),
+  };
+  
+  normalized._uniqueId = getPatientUniqueId(normalized);
+  return normalized;
+};
+
+export default function PatientCall({ auth, patients = [], currentPatient = null }) {
+  // State management
+  const [patientList, setPatientList] = useState([]);
+  const [current, setCurrent] = useState(null);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [filters, setFilters] = useState({
+    unit: '',
+    destination: ''
+  });
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [notification, setNotification] = useState({ show: false, message: '', type: 'info' });
+  
+  const patientListRef = useRef([]);
+  const pusherRef = useRef(null);
+  const channelRef = useRef(null);
+
+  // Group patients by examination
+  const groupPatients = useCallback((patientsList) => {
+    const result = [];
+    
+    patientsList.forEach((patient) => {
+      // Process examination names
+      let examination_list = [];
+      if (patient.examination_names) {
+        examination_list = patient.examination_names
+          .split(';')
+          .map(e => e.trim())
+          .filter(Boolean);
+      } else if (patient.examination_list && Array.isArray(patient.examination_list)) {
+        examination_list = [...patient.examination_list];
+      }
+      
+      // Create one row per examination
+      if (examination_list.length === 0) {
+        result.push({
+          ...patient,
+          examination_list: [],
+          examination_name: '',
+          _uniqueId: `${patient.registration_id || patient.id}-0` 
+        });
+      } else {
+        // Sort and deduplicate
+        const sortedExams = [...new Set(examination_list)].sort();
+        
+        sortedExams.forEach((exam, index) => {
+          result.push({
+            ...patient,
+            examination_list: sortedExams,
+            examination_name: exam,
+            _uniqueId: `${patient.registration_id || patient.id}-${index}` 
+          });
+        });
+      }
+    });
+    
+    console.log(`📊 Grouped ${patientsList.length} patients into ${result.length} rows`);
+    return result;
+  }, []);
+
+  // Fetch patient data from API
+  const fetchPatientData = useCallback(async () => {
+    try {
+      console.log('🔄 Fetching patient data from API...');
+      
+      const response = await axios.get('/api/patients/queue', {
+        params: { _t: Date.now() }, // Prevent caching
+        headers: {
+          'Cache-Control': 'no-cache'
+        }
+      });
+      
+      if (response.data && Array.isArray(response.data)) {
+        // Normalize and group patient data
+        const processedPatients = response.data.map(normalizePatient);
+        const groupedPatients = groupPatients(processedPatients);
+        
+        // Only update if there are actual changes
+        const currentList = patientListRef.current;
+        const hasChanges = JSON.stringify(groupedPatients) !== JSON.stringify(currentList);
+        
+        if (hasChanges) {
+          console.log('✅ Data updated:', groupedPatients.length, 'patients');
+          patientListRef.current = groupedPatients;
+          setPatientList(groupedPatients);
+        }
+      }
+    } catch (error) {
+      console.error('❌ Error fetching patient data:', error.message);
+      setNotification({
+        show: true,
+        message: 'Gagal memuat data pasien',
+        type: 'error'
+      });
+    } finally {
+      setIsRefreshing(false);
+    }
+  }, [groupPatients]);
+
+  // Handle manual refresh
+  const handleManualRefresh = useCallback(() => {
+    if (isRefreshing) return;
+    setIsRefreshing(true);
+    fetchPatientData();
+  }, [fetchPatientData, isRefreshing]);
+
+  // Call patient function
+  const callPatient = useCallback(async (patient, examination) => {
+    try {
+      const unit = patient.unit || 'pemeriksaan';
+      const destination = examination ? examination.trim() : 'pemeriksaan';
+      
+      console.log('📞 Calling patient:', patient.patient_name, 'for', destination);
+      
+      // Get the examination result ID
+      const resultId = patient.result_ids ? patient.result_ids.split(',')[0] : null;
+      
+      if (!resultId) {
+        throw new Error('Tidak dapat menemukan ID hasil pemeriksaan');
+      }
+
+      // Call the endpoint
+      await axios.post(route('admin.patients.call'), {
+        patient_id: resultId,
+        patient_name: patient.patient_name || 'Nama Pasien',
+        unit: unit.toUpperCase(),
+        destination: destination,
+        registration_id: patient.registration_id || null,
+        examination_names: destination
+      });
+
+      console.log('✅ Patient call sent successfully');
+      
+      // Set current patient for display
+      setCurrent({
+        ...patient,
+        examination_name: destination,
+        examination_names: destination
+      });
+      
+      // Show success notification
+      setNotification({
+        show: true,
+        message: `Memanggil ${patient.patient_name} untuk ${destination}`,
+        type: 'success'
+      });
+      
+      // Auto-hide notification
+      setTimeout(() => {
+        setNotification(prev => ({ ...prev, show: false }));
+      }, 3000);
+      
+      // Refresh data after a short delay
+      setTimeout(() => {
+        fetchPatientData();
+      }, 1000);
+      
+    } catch (err) {
+      console.error('❌ Call patient error', err);
+      setNotification({
+        show: true,
+        message: `Gagal memanggil pasien: ${err.message}`,
+        type: 'error'
+      });
+    }
+  }, [fetchPatientData]);
+
+  // Handle Pusher events
+  const handlePatientCalled = useCallback((data) => {
+    console.log('[PUSHER] PatientCalled received:', data);
+
+    const currentPatient = data?.current ?? null;
+    
+    if (currentPatient) {
+      // Set current patient for display only
+      setCurrent(currentPatient);
+      
+      // Show notification
+      setNotification({
+        show: true,
+        message: `Pasien dipanggil: ${currentPatient.patient_name}`,
+        type: 'info'
+      });
+      
+      // Refresh data after a small delay
+      setTimeout(() => {
+        fetchPatientData();
+      }, 1500);
+    }
+  }, [fetchPatientData]);
+
+  // Setup Pusher on component mount
+  useEffect(() => {
+    const key = import.meta.env.VITE_PUSHER_APP_KEY;
+    const cluster = import.meta.env.VITE_PUSHER_APP_CLUSTER;
+
+    if (!key) {
+      console.warn('VITE_PUSHER_APP_KEY tidak ada, realtime mati');
+      return;
+    }
+
+    if (pusherRef.current) return;
+
+    const pusher = new Pusher(key, {
+      cluster,
+      forceTLS: true,
+    });
+
+    pusherRef.current = pusher;
+    const channel = pusher.subscribe('public-patient-calls');
+    channelRef.current = channel;
+
+    channel.bind('App\\Events\\PatientCalled', handlePatientCalled);
+    channel.bind('patient.called', handlePatientCalled);
+
+    pusher.connection.bind('error', err => {
+      console.error('[PUSHER] error:', err);
+    });
+
+    console.log('[PUSHER] connected');
+
+    return () => {
+      try {
+        channel.unbind_all();
+        pusher.unsubscribe('public-patient-calls');
+        pusher.disconnect();
+        pusherRef.current = null;
+        channelRef.current = null;
+      } catch (e) {
+        console.error('[PUSHER] cleanup error', e);
+      }
+    };
+  }, [handlePatientCalled]);
+
+  // Initialize component
+  useEffect(() => {
+    console.log('🚀 Starting patient data polling...');
+    
+    // Initial data fetch
+    fetchPatientData();
+    
+    // Set up polling every 10 seconds
+    const intervalId = setInterval(() => {
+      console.log('⏰ Auto-refreshing patient data...');
+      fetchPatientData();
+    }, 10000);
+    
+    // Cleanup
+    return () => {
+      console.log('🧹 Stopping polling...');
+      clearInterval(intervalId);
+    };
+  }, [fetchPatientData]);
+
+  // Filter patients based on search and filters
+  const filteredPatients = useMemo(() => {
+    return patientList.filter(patient => {
+      // Search by patient name or registration ID
+      const matchesSearch = !searchTerm || 
+        (patient.patient_name && patient.patient_name.toLowerCase().includes(searchTerm.toLowerCase())) ||
+        (patient.registration_id && patient.registration_id.toLowerCase().includes(searchTerm.toLowerCase()));
+      
+      // Filter by unit
+      const matchesUnit = !filters.unit || 
+        (patient.unit && patient.unit.toLowerCase() === filters.unit.toLowerCase());
+      
+      // Filter by examination
+      const matchesExamination = !filters.destination || 
+        (patient.examination_name && patient.examination_name.toLowerCase().includes(filters.destination.toLowerCase()));
+      
+      return matchesSearch && matchesUnit && matchesExamination;
+    });
+  }, [patientList, searchTerm, filters]);
+
+  // Get unique units and destinations for filters
+  const units = useMemo(() => {
+    const unique = new Set();
+    patientList.forEach(p => p.unit && unique.add(p.unit));
+    return Array.from(unique).sort();
+  }, [patientList]);
+
+  const destinations = useMemo(() => {
+    const unique = new Set();
+    patientList.forEach(p => {
+      if (p.examination_list) {
+        p.examination_list.forEach(exam => unique.add(exam));
+      }
+    });
+    return Array.from(unique).sort();
+  }, [patientList]);
+
+  // Clear all filters
+  const clearFilters = useCallback(() => {
+    setSearchTerm('');
+    setFilters({
+      unit: '',
+      destination: ''
+    });
+  }, []);
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <Head title="Pemanggilan Pasien" />
+
+      <div className="py-6">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          {/* Header */}
+          <div className="flex flex-col md:flex-row md:items-center justify-between mb-6">
+            <h1 className="text-2xl font-bold text-gray-900">Pemanggilan Pasien</h1>
+            
+            <div className="mt-4 md:mt-0 flex items-center space-x-2">
+              <div className="relative">
+                <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                  <Search className="h-4 w-4 text-gray-400" />
+                </div>
+                <input
+                  type="text"
+                  placeholder="Cari pasien..."
+                  className="block w-full pl-10 pr-3 py-2 border border-gray-300 rounded-md leading-5 bg-white placeholder-gray-500 focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+                  value={searchTerm}
+                  onChange={(e) => setSearchTerm(e.target.value)}
+                />
+              </div>
+              
+              <button
+                onClick={handleManualRefresh}
+                disabled={isRefreshing}
+                className="inline-flex items-center px-3 py-2 border border-transparent text-sm leading-4 font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {isRefreshing ? (
+                  <>
+                    <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                    Memperbarui...
+                  </>
+                ) : 'Refresh'}
+              </button>
+            </div>
+          </div>
+
+          {/* Filters */}
+          <div className="bg-white shadow-sm rounded-lg p-4 mb-6">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div>
+                <label htmlFor="unit" className="block text-sm font-medium text-gray-700 mb-1">Unit</label>
+                <select
+                  id="unit"
+                  className="block w-full pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm rounded-md"
+                  value={filters.unit}
+                  onChange={(e) => setFilters(prev => ({ ...prev, unit: e.target.value }))}
+                >
+                  <option value="">Semua Unit</option>
+                  {units.map(unit => (
+                    <option key={unit} value={unit}>{unit}</option>
+                  ))}
+                </select>
+              </div>
+              
+              <div>
+                <label htmlFor="destination" className="block text-sm font-medium text-gray-700 mb-1">Pemeriksaan</label>
+                <select
+                  id="destination"
+                  className="block w-full pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm rounded-md"
+                  value={filters.destination}
+                  onChange={(e) => setFilters(prev => ({ ...prev, destination: e.target.value }))}
+                >
+                  <option value="">Semua Pemeriksaan</option>
+                  {destinations.map(dest => (
+                    <option key={dest} value={dest}>{dest}</option>
+                  ))}
+                </select>
+              </div>
+              
+              <div className="flex items-end">
+                <button
+                  onClick={clearFilters}
+                  className="inline-flex items-center px-4 py-2 border border-gray-300 shadow-sm text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
+                >
+                  Reset Filter
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* Current Patient Display */}
+          {current && (
+            <div className="bg-blue-50 border-l-4 border-blue-400 p-4 mb-6 rounded-r">
+              <div className="flex">
+                <div className="flex-shrink-0">
+                  <svg className="h-5 w-5 text-blue-400" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
+                    <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
+                  </svg>
+                </div>
+                <div className="ml-3">
+                  <h3 className="text-sm font-medium text-blue-800">Sedang Dipanggil</h3>
+                  <div className="mt-2 text-sm text-blue-700">
+                    <p>{current.patient_name} - {current.examination_name || 'Pemeriksaan'}</p>
+                    <p className="mt-1 text-xs text-blue-600">
+                      {current.unit} • {current.registration_id || 'No. RM: -'}
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Notification */}
+          {notification.show && (
+            <div className={`mb-4 p-4 rounded-md ${
+              notification.type === 'error' ? 'bg-red-50 border-l-4 border-red-400' :
+              notification.type === 'success' ? 'bg-green-50 border-l-4 border-green-400' :
+              'bg-blue-50 border-l-4 border-blue-400'
+            }`}>
+              <div className="flex">
+                <div className="flex-shrink-0">
+                  {notification.type === 'error' ? (
+                    <svg className="h-5 w-5 text-red-400" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
+                      <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+                    </svg>
+                  ) : notification.type === 'success' ? (
+                    <svg className="h-5 w-5 text-green-400" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
+                      <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                    </svg>
+                  ) : (
+                    <svg className="h-5 w-5 text-blue-400" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
+                      <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
+                    </svg>
+                  )}
+                </div>
+                <div className="ml-3">
+                  <p className={`text-sm ${
+                    notification.type === 'error' ? 'text-red-700' :
+                    notification.type === 'success' ? 'text-green-700' :
+                    'text-blue-700'
+                  }`}>
+                    {notification.message}
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Patient List */}
+          <div className="bg-white shadow overflow-hidden sm:rounded-lg">
+            <div className="overflow-x-auto">
+              <table className="min-w-full divide-y divide-gray-200">
+                <thead className="bg-gray-50">
+                  <tr>
+                    <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">No. Antrian</th>
+                    <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Nama Pasien</th>
+                    <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Unit</th>
+                    <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Pemeriksaan</th>
+                    <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Aksi</th>
+                  </tr>
+                </thead>
+                <tbody className="bg-white divide-y divide-gray-200">
+                  {filteredPatients.length > 0 ? (
+                    filteredPatients.map((patient) => (
+                      <tr key={patient._uniqueId} className="hover:bg-gray-50">
+                        <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
+                          {patient.registration_id || '-'}
+                        </td>
+                        <td className="px-6 py-4 whitespace-nowrap">
+                          <div className="text-sm font-medium text-gray-900">{patient.patient_name}</div>
+                          <div className="text-xs text-gray-500">RM: {patient.medical_record_id || '-'}</div>
+                        </td>
+                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                          {patient.unit || '-'}
+                        </td>
+                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                          {patient.examination_name || '-'}
+                        </td>
+                        <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                          <button
+                            onClick={() => callPatient(patient, patient.examination_name)}
+                            className="text-blue-600 hover:text-blue-900 mr-4"
+                          >
+                            Panggil
+                          </button>
+                        </td>
+                      </tr>
+                    ))
+                  ) : (
+                    <tr>
+                      <td colSpan="5" className="px-6 py-4 text-center text-sm text-gray-500">
+                        {isRefreshing ? 'Memuat data...' : 'Tidak ada data pasien yang sesuai dengan filter'}
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+          
+          {/* Status */}
+          <div className="mt-4 text-right text-xs text-gray-500">
+            Total: {filteredPatients.length} pasien • Terakhir diperbarui: {new Date().toLocaleTimeString()}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
